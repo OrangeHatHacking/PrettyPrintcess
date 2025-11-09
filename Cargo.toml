@@ -1,0 +1,9 @@
+[package]
+name = "PrettyPrintcess"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cidr = "0.3.1"
+get_if_addrs = "0.5.3"
+local-ip-address = "0.6.5"
