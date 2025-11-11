@@ -4,25 +4,24 @@ use get_if_addrs::{IfAddr, get_if_addrs};
 use local_ip_address::local_ip;
 use rand::Rng;
 use std::collections::HashMap;
+use std::env::temp_dir;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::str::FromStr;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 const ORDERED_PORTS: [u16; 5] = [9100, 631, 515, 1883, 8883];
 
-const CONCURRENCY: usize = 4; // amt of concurrent request threads
+const CONCURRENCY: usize = 64; // amt of concurrent request threads
 const MIN_JITTER_MS: u64 = 50;
 const MAX_JITTER_MS: u64 = 400;
-const CONNECT_TIMEOUT_SECS: u64 = 2;
+const CONNECT_TIMEOUT_SECS: u64 = 1;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all_ips: Vec<Ipv4Addr> = get_ip_list()?; // ? is used to unwrap the Result object
-    for host in &all_ips {
-        println!("{}", host);
-    }
 
     let online_printers: Vec<Option<(u16, Ipv4Addr)>> = stream::iter(all_ips)
         .map(|ip| async move { check_ports(ip).await })
@@ -31,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await; // these last 2 (collect and await) handle all the async thread mess
 
     let mut printers_map: HashMap<u16, Vec<Ipv4Addr>> = HashMap::new();
+    // flatten() will remove the None values because online_printers is a Vec of Options
     for (port, ip) in online_printers.into_iter().flatten() {
         printers_map.entry(port).or_default().push(ip); // 
         // or_default will create value entry if one doesn't exist for key (port)
@@ -39,7 +39,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// sends carriage returns to print out blank pages
+fn send_blank_pages(pages: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(pages);
+    for _ in 0..pages {
+        v.push(0x0Cu8);
+    }
+    v
+}
+
+async fn send_on_9100(ip: Ipv4Addr, data: &[u8]) -> Result<(), String> {
+    let sock: SocketAddr = (ip, 9100u16).into();
+
+    // connect to port
+    let stream = timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(&sock),
+    )
+    .await
+    .map_err(|_| format!("connection to {} timed out", ip))?
+    .map_err(|e| format!("connection error for {}: {}", ip, e))?;
+
+    // Write to port
+    let mut stream = stream; // called "shadowing" the var with new mut binding
+    timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        stream.write_all(data),
+    )
+    .await
+    .map_err(|_| format!("Write timed out on {}", ip))?
+    .map_err(|e| format!("Write error to {}: {}", ip, e))?;
+
+    // attempt graceful shutdown/flush
+    if let Err(e) = timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), stream.shutdown()).await {
+        let _ = e;
+    }
+    Ok(())
+}
+
 async fn check_ports(ip: Ipv4Addr) -> Option<(u16, Ipv4Addr)> {
+    println!("checking ports on {}", ip);
     let mut rng = rand::rng();
     let initial_jitter = rng.random_range(MIN_JITTER_MS..=MAX_JITTER_MS);
     sleep(Duration::from_millis(initial_jitter)).await;
@@ -50,6 +89,7 @@ async fn check_ports(ip: Ipv4Addr) -> Option<(u16, Ipv4Addr)> {
 
         let sock = SocketAddrV4::new(ip, port);
         if try_connect(sock).await {
+            println!("port {} open at {}", port, ip);
             return Some((port, ip));
         }
     }
