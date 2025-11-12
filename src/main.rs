@@ -1,184 +1,19 @@
-use cidr::Ipv4Cidr;
-use futures::stream::{self, StreamExt};
-use get_if_addrs::{IfAddr, get_if_addrs};
-use local_ip_address::local_ip;
-use rand::Rng;
+mod network_scanner;
+mod printer;
+
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
+use std::net::Ipv4Addr;
 
-const ORDERED_PORTS: [u16; 5] = [9100, 631, 515, 1883, 8883];
-
-const CONCURRENCY: usize = 100; // amt of concurrent request threads
-const MIN_JITTER_MS: u64 = 50;
-const MAX_JITTER_MS: u64 = 400;
-const CONNECT_TIMEOUT_SECS: u64 = 1;
+use network_scanner::get_online_printers;
+use printer::full_steam_ahead;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let all_ips: Vec<Ipv4Addr> = get_ip_list()?; // ? is used to unwrap the Result object
+    let printers_map: HashMap<u16, Vec<Ipv4Addr>> = get_online_printers().await?;
 
-    let online_printers: Vec<Option<(u16, Ipv4Addr)>> = stream::iter(all_ips)
-        .map(|ip| async move { check_ports(ip).await })
-        .buffer_unordered(CONCURRENCY)
-        .collect()
-        .await;
-    // these last 2 (collect and await) handle all the async mess in terms of writing to the vec from multiple threads
-
-    let mut printers_map: HashMap<u16, Vec<Ipv4Addr>> = HashMap::new();
-    // flatten() will remove the None values because online_printers is a Vec of Options
-    for (port, ip) in online_printers.into_iter().flatten() {
-        printers_map.entry(port).or_default().push(ip); // 
-        // or_default will create value entry if one doesn't exist for key (port)
-    }
-
-    let num_pages: usize = 5;
-    let payload: Vec<u8> = blank_pages_payload(num_pages);
+    full_steam_ahead(printers_map).await?;
 
     // iterate through map per port and start blastin'
-    if let Some(printer_vec) = printers_map.get(&9100) {
-        println!(
-            "Blastin' default of {} pages to {} printers on port 9100",
-            num_pages,
-            printer_vec.len()
-        );
-        stream::iter(printer_vec)
-            .map(|printer_ip| {
-                let payload = payload.clone();
-                async move {
-                    // stream::iter works by borrowing each element in the iterator
-                    // send_on_9100 expects printer_ip not &printer_ip so have to dereference (*)
-                    match send_on_9100(*printer_ip, &payload).await {
-                        Ok(_) => println!("{}: sent OK", printer_ip),
-                        Err(e) => println!("Error sending page to {}: {}", printer_ip, e),
-                    }
-                }
-            })
-            .buffer_unordered(CONCURRENCY)
-            .collect::<()>()
-            .await;
-    }
 
     Ok(())
-}
-
-// sends carriage returns to print out blank pages
-fn blank_pages_payload(pages: usize) -> Vec<u8> {
-    let mut v = Vec::with_capacity(pages);
-    for _ in 0..pages {
-        v.push(0x0Cu8);
-    }
-    v
-}
-
-async fn send_on_9100(ip: Ipv4Addr, data: &[u8]) -> Result<(), String> {
-    let sock: SocketAddr = (ip, 9100u16).into();
-
-    // connect to port
-    let stream = timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        TcpStream::connect(&sock),
-    )
-    .await
-    .map_err(|_| format!("connection to {} timed out", ip))?
-    .map_err(|e| format!("connection error for {}: {}", ip, e))?;
-
-    // Write to port
-    let mut stream = stream; // called "shadowing" the var with new mut binding
-    timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        stream.write_all(data),
-    )
-    .await
-    .map_err(|_| format!("Write timed out on {}", ip))?
-    .map_err(|e| format!("Write error to {}: {}", ip, e))?;
-
-    // attempt graceful shutdown/flush
-    if let Err(e) = timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), stream.shutdown()).await {
-        let _ = e;
-    }
-    Ok(())
-}
-
-async fn check_ports(ip: Ipv4Addr) -> Option<(u16, Ipv4Addr)> {
-    let mut rng = rand::rng();
-    let initial_jitter = rng.random_range(MIN_JITTER_MS..=MAX_JITTER_MS);
-    sleep(Duration::from_millis(initial_jitter)).await;
-
-    for &port in &ORDERED_PORTS {
-        let per_port_jitter = rng.random_range(0..=100);
-        sleep(Duration::from_millis(per_port_jitter)).await;
-
-        let sock = SocketAddrV4::new(ip, port);
-        if try_connect(sock).await {
-            println!("port {} open at {}", port, ip);
-            return Some((port, ip));
-        }
-    }
-    None
-}
-
-async fn try_connect(sock: SocketAddrV4) -> bool {
-    let addr = SocketAddr::V4(sock);
-    match timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        TcpStream::connect(addr),
-    )
-    .await
-    {
-        Ok(Ok(_stream)) => true,
-        _ => false,
-    }
-}
-
-fn get_ip_list() -> Result<Vec<Ipv4Addr>, Box<dyn std::error::Error>> {
-    // get local IP to match to interface
-    let machine_ip = match local_ip()? {
-        IpAddr::V4(ipv4) => ipv4,
-        IpAddr::V6(_) => return Err("IPv6 not supported".into()),
-    };
-
-    // get interface
-    // And because I know I'll forget, that weird |thing| in the find iterator function
-    // It's a closure (an anonymous function) and it takes iface as an argument
-    // If you've forgotten what it is look it up
-    let iface = get_if_addrs()?
-        .into_iter()
-        // matches!(expr, PATTERN if GUARD) expands to true if expr matches PATTERN and the optional if guard is true
-        .find(|iface| matches!(&iface.addr, IfAddr::V4(v4) if v4.ip == machine_ip))
-        .ok_or("Couldn't find current network interface")?;
-
-    if let IfAddr::V4(iface_info) = iface.addr {
-        let ip = iface_info.ip;
-        let netmask = iface_info.netmask;
-        let prefix_len = u32::from(netmask).count_ones() as u8;
-
-        // use bitwise AND between local IP and netmask to get base IP
-        let network_base = Ipv4Addr::from(u32::from(ip) & u32::from(netmask));
-        let cidr_object = Ipv4Cidr::new(network_base, prefix_len)?;
-
-        println!(
-            "Interface: {}\nIP: {}\nNetmask: {}\nNetwork: {}/{}\n",
-            iface.name,
-            ip,
-            netmask,
-            cidr_object.first_address(),
-            prefix_len
-        );
-
-        let mut hosts: Vec<_> = cidr_object.iter().map(|host| host.address()).collect();
-
-        // remove broadcast & network
-        if hosts.len() > 2 {
-            hosts.remove(0);
-            hosts.pop();
-        }
-
-        return Ok(hosts);
-    }
-
-    Err("No interface for IPv4 found".into())
 }
